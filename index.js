@@ -758,13 +758,13 @@ async function handleApi(request, response, url) {
   if (profilePhotoMatch && request.method === 'GET') {
     const viewer = requireUser(request)
     const userId = decodeURIComponent(profilePhotoMatch[1])
-    const student = data.users.find((item) => item.id === userId && item.role === 'student')
-    if (!student) throw new ApiError(404, 'Student account not found.')
+    const target = data.users.find((item) => item.id === userId)
+    if (!target) throw new ApiError(404, 'User account not found.')
     const mayView = viewer.role === 'admin' ||
-      (viewer.role === 'teacher' && canAccessClass(viewer, student.className)) ||
-      (viewer.role === 'student' && viewer.id === student.id)
-    if (!mayView) throw new ApiError(403, 'You cannot view this student profile photo.')
-    const photo = await profilePhotoCollection.findOne({ _id: student.id })
+      viewer.id === target.id ||
+      (viewer.role === 'teacher' && target.role === 'student' && canAccessClass(viewer, target.className))
+    if (!mayView) throw new ApiError(403, 'You cannot view this user profile photo.')
+    const photo = await profilePhotoCollection.findOne({ _id: target.id })
     if (!photo) throw new ApiError(404, 'No profile photo has been uploaded.')
     response.writeHead(200, {
       'content-type': photo.contentType,
@@ -777,10 +777,13 @@ async function handleApi(request, response, url) {
   if (profilePhotoMatch && request.method === 'POST') {
     const uploader = requireUser(request, ['admin', 'teacher'])
     const userId = decodeURIComponent(profilePhotoMatch[1])
-    const student = data.users.find((item) => item.id === userId && item.role === 'student')
-    if (!student) throw new ApiError(404, 'Student account not found.')
-    if (uploader.role === 'teacher' && !canAccessClass(uploader, student.className)) {
-      throw new ApiError(403, 'You can upload photos only for students in your assigned classes.')
+    const target = data.users.find((item) => item.id === userId)
+    if (!target) throw new ApiError(404, 'User account not found.')
+    const mayUpload = uploader.role === 'admin' ||
+      uploader.id === target.id ||
+      (uploader.role === 'teacher' && target.role === 'student' && canAccessClass(uploader, target.className))
+    if (!mayUpload) {
+      throw new ApiError(403, 'Teachers can upload profile photos only for themselves or students in their assigned classes.')
     }
     const body = await readJson(request)
     const dataUrlMatch = typeof body.dataUrl === 'string'
@@ -795,7 +798,7 @@ async function handleApi(request, response, url) {
       throw new ApiError(400, 'The uploaded file is not a valid image.')
     }
     await profilePhotoCollection.updateOne(
-      { _id: student.id },
+      { _id: target.id },
       {
         $set: {
           contentType: dataUrlMatch[1],
@@ -1185,7 +1188,7 @@ export async function vercelNodeHandler(request, response) {
     response.setHeader('access-control-allow-origin', origin)
     response.setHeader('vary', 'Origin')
   }
-  response.setHeader('access-control-allow-methods', 'GET, POST, DELETE, OPTIONS')
+  response.setHeader('access-control-allow-methods', 'GET, POST, PUT, DELETE, OPTIONS')
   response.setHeader('access-control-allow-headers', 'Authorization, Content-Type')
   if (request.method === 'OPTIONS') {
     response.writeHead(204)
