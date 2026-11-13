@@ -343,8 +343,8 @@ function requireDate(value, label) {
 function assignedClass(user, requestedClass) {
   const className = requestedClass ? requireText(requestedClass, 'Class', 60) : user.className
   if (!className) throw new ApiError(400, 'Assign a class to this account first.')
-  if (user.role === 'teacher' && user.className && className !== user.className) {
-    throw new ApiError(403, 'You can only manage your assigned class.')
+  if (user.role === 'teacher' && !canAccessClass(user, className)) {
+    throw new ApiError(403, 'You can only manage one of your assigned classes.')
   }
   return className
 }
