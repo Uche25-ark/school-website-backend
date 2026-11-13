@@ -1066,3 +1066,5 @@ export async function startLocalServer() {
     console.log(`School portal API listening on http://localhost:${PORT}`)
   })
 }
+
+export default vercelNodeHandler
