@@ -521,7 +521,7 @@ async function handleApi(request, response, url) {
   }
 
   if (request.method === 'POST' && url.pathname === '/api/account/password') {
-    const user = requireUser(request, ['teacher', 'student'])
+    const user = requireUser(request, ['admin', 'teacher', 'student'])
     const body = await readJson(request)
     if (typeof body.currentPassword !== 'string' || body.currentPassword.length < 1 || body.currentPassword.length > 100) {
       throw new ApiError(400, 'Enter your current password.')
