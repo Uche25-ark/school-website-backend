@@ -16,3 +16,9 @@ This folder is a standalone Node.js API project for Vercel Functions. It keeps p
 Vercel Free runs the configured expiry schedule once daily. Opening the portal also processes expired assignments and exams; a missed score may otherwise wait until the daily run. Per-minute scheduled checks require Vercel Pro.
 
 The local Node server remains available with `npm start` when run from this directory. The Vercel function does not start a persistent server or background timer.
+
+## Portal roles and approvals
+
+Only administrators and designated form teachers can create student accounts. Student accounts require gender, date of birth, and date joined. Form teachers can view students in their assigned classes and request edits to those student accounts; a teacher's primary class remains accessible independently of additional form-teacher classes.
+
+Teacher changes to student accounts, profile photos, attendance, assignments, exams, assessments, marks, feedback, and report cards are queued for administrator review. Administrators can approve or disapprove them from the portal's **Approvals** page. Password changes remain immediate.

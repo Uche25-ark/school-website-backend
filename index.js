@@ -1,5 +1,6 @@
 import 'dotenv/config'
 import { createServer } from 'node:http'
+import { Readable } from 'node:stream'
 import { readFile } from 'node:fs/promises'
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
@@ -30,8 +31,8 @@ function hashPassword(password, salt) {
   return scryptSync(password, salt, 64).toString('hex')
 }
 
-function makeUser({ name, email, password, role, className = '', subject = '' }) {
-  const salt = randomBytes(16).toString('hex')
+function makeUser({ name, email, password, role, className = '', subject = '', gender = '', dateOfBirth = '', dateJoined = '', credentials }) {
+  const salt = credentials?.salt || randomBytes(16).toString('hex')
   return {
     id: randomBytes(8).toString('hex'),
     name,
@@ -40,8 +41,12 @@ function makeUser({ name, email, password, role, className = '', subject = '' })
     className,
     subject,
     formTeacherClassNames: [],
+    isFormTeacher: false,
+    gender,
+    dateOfBirth,
+    dateJoined,
     salt,
-    passwordHash: hashPassword(password, salt),
+    passwordHash: credentials?.passwordHash || hashPassword(password, salt),
   }
 }
 
@@ -85,6 +90,7 @@ function seedData() {
     assignmentAttempts: [],
     examAttempts: [],
     assignmentSubmissions: [],
+    pendingApprovals: [],
   }
 }
 
@@ -127,7 +133,7 @@ async function loadData() {
     }
   }
 
-  for (const key of ['reportCards', 'assessments', 'assessmentRecords', 'assignmentAttempts', 'examAttempts', 'assignmentSubmissions']) {
+  for (const key of ['reportCards', 'assessments', 'assessmentRecords', 'assignmentAttempts', 'examAttempts', 'assignmentSubmissions', 'pendingApprovals']) {
     if (data[key] === undefined) {
       data[key] = []
       needsSave = true
@@ -176,6 +182,22 @@ async function loadData() {
   for (const user of data.users) {
     if (!Array.isArray(user.formTeacherClassNames)) {
       user.formTeacherClassNames = []
+      needsSave = true
+    }
+    if (typeof user.isFormTeacher !== 'boolean') {
+      user.isFormTeacher = user.role === 'teacher' && user.formTeacherClassNames.length > 0
+      needsSave = true
+    }
+    if (user.gender === undefined) {
+      user.gender = ''
+      needsSave = true
+    }
+    if (user.dateOfBirth === undefined) {
+      user.dateOfBirth = ''
+      needsSave = true
+    }
+    if (user.dateJoined === undefined) {
+      user.dateJoined = ''
       needsSave = true
     }
   }
@@ -309,6 +331,15 @@ function requireText(value, label, maxLength = 200) {
   return value.trim()
 }
 
+function requireDate(value, label) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value) ||
+    Number.isNaN(Date.parse(`${value}T00:00:00Z`)) ||
+    new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) !== value) {
+    throw new ApiError(400, `${label} must be a valid date.`)
+  }
+  return value
+}
+
 function assignedClass(user, requestedClass) {
   const className = requestedClass ? requireText(requestedClass, 'Class', 60) : user.className
   if (!className) throw new ApiError(400, 'Assign a class to this account first.')
@@ -320,7 +351,7 @@ function assignedClass(user, requestedClass) {
 
 function teacherClassNames(user) {
   if (user.role !== 'teacher') return []
-  return [...new Set([user.className, ...(user.formTeacherClassNames || [])].filter(Boolean))]
+  return [...new Set([user.className, ...(user.isFormTeacher ? user.formTeacherClassNames || [] : [])].filter(Boolean))]
 }
 
 function canAccessClass(user, className) {
@@ -338,6 +369,21 @@ function validProfileImage(contentType, bytes) {
   return contentType === 'image/webp' &&
     bytes.toString('ascii', 0, 4) === 'RIFF' &&
     bytes.toString('ascii', 8, 12) === 'WEBP'
+}
+
+function parseProfileImage(dataUrl) {
+  const match = typeof dataUrl === 'string'
+    ? dataUrl.match(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/]+={0,2})$/)
+    : null
+  if (!match) throw new ApiError(400, 'Choose a JPEG, PNG, or WebP image.')
+  const bytes = Buffer.from(match[2], 'base64')
+  if (bytes.length < 1 || bytes.length > 700 * 1024) {
+    throw new ApiError(413, 'Profile photos must be 700 KB or smaller.')
+  }
+  if (!validProfileImage(match[1], bytes)) {
+    throw new ApiError(400, 'The uploaded file is not a valid image.')
+  }
+  return { contentType: match[1], data: match[2] }
 }
 
 function assignedSubject(user, requestedSubject) {
@@ -560,7 +606,136 @@ function storeReportCard(reportCard) {
   data.reportCards.push(reportCard)
 }
 
+function teacherActionNeedsApproval(method, pathname) {
+  if (method === 'POST' && [
+    '/api/users',
+    '/api/attendance',
+    '/api/assignments',
+    '/api/assessments',
+    '/api/report-cards',
+    '/api/report-cards/import',
+    '/api/exams',
+  ].includes(pathname)) return true
+  if (method === 'PUT' && /^\/api\/users\/[^/]+$/.test(pathname)) return true
+  return method === 'POST' && (
+    /^\/api\/users\/[^/]+\/profile-photo$/.test(pathname) ||
+    /^\/api\/assessments\/[^/]+\/records$/.test(pathname) ||
+    /^\/api\/results\/[^/]+\/feedback$/.test(pathname)
+  )
+}
+
+function approvalTitle(approval, targetName) {
+  const { method, path: pathname, body } = approval
+  if (pathname === '/api/users' && method === 'POST') return `Create student account: ${body.name || 'Unnamed student'}`
+  if (/^\/api\/users\/[^/]+$/.test(pathname) && method === 'PUT') return `Edit account: ${body.name || 'Student details'}`
+  if (/\/profile-photo$/.test(pathname)) return `Update profile photo: ${targetName || 'Account'}`
+  if (pathname === '/api/attendance') return `Record attendance: ${body.className || 'Class'} · ${body.date || ''}`
+  if (pathname === '/api/assignments') return `Create assignment: ${body.title || 'Untitled assignment'}`
+  if (pathname === '/api/assessments') return `Create assessment: ${body.title || 'Untitled assessment'}`
+  if (/\/records$/.test(pathname)) return 'Submit assessment marks'
+  if (/\/feedback$/.test(pathname)) return 'Submit result feedback'
+  if (pathname === '/api/report-cards/import') return `Import report-card results (${body.records?.length || 0} rows)`
+  if (pathname === '/api/report-cards') return 'Create report-card result'
+  if (pathname === '/api/exams') return `Create exam: ${body.title || 'Untitled exam'}`
+  return `${method} ${pathname}`
+}
+
+function publicApproval(approval) {
+  const actor = data.users.find((item) => item.id === approval.actorId)
+  const targetMatch = approval.path.match(/^\/api\/users\/([^/]+)/)
+  const target = targetMatch && data.users.find((item) => item.id === decodeURIComponent(targetMatch[1]))
+  const body = { ...(approval.body || {}) }
+  delete body.password
+  if (approval.photoId || body.dataUrl) {
+    delete body.dataUrl
+    body.photoAttached = true
+  }
+  return {
+    id: approval.id,
+    status: approval.status,
+    method: approval.method,
+    path: approval.path,
+    title: approvalTitle(approval, target?.name),
+    targetName: target?.name || '',
+    actorName: actor?.name || 'Deleted user',
+    actorEmail: actor?.email || '',
+    createdAt: approval.createdAt,
+    decidedAt: approval.decidedAt || '',
+    decision: approval.decision || '',
+    decisionNote: approval.decisionNote || '',
+    error: approval.error || '',
+    body,
+  }
+}
+
 async function handleApi(request, response, url) {
+  const actorToken = getSessionToken(request)
+  const actorId = actorToken && sessions.get(actorToken)
+  const actor = data.users.find((item) => item.id === actorId)
+  if (actor?.role === 'teacher' && !request.approvalExecution && teacherActionNeedsApproval(request.method, url.pathname)) {
+    const body = await readJson(request)
+    if (url.pathname === '/api/users') {
+      if (!actor.isFormTeacher || body.role !== 'student') {
+        throw new ApiError(403, 'Only an assigned form teacher can request student account creation.')
+      }
+      const password = requireText(body.password, 'Password', 100)
+      if (password.length < 8) throw new ApiError(400, 'Password must be at least 8 characters long.')
+      const salt = randomBytes(16).toString('hex')
+      delete body.password
+      const credentials = { salt, passwordHash: hashPassword(password, salt) }
+      const approval = {
+        id: randomBytes(10).toString('hex'),
+        actorId: actor.id,
+        method: request.method,
+        path: url.pathname,
+        body,
+        credentials,
+        status: 'pending',
+        createdAt: new Date().toISOString(),
+      }
+      if (approvalPhoto) {
+        approval.photoId = approval.id
+        await profilePhotoCollection.insertOne({ _id: approval.photoId, ...approvalPhoto, updatedAt: approval.createdAt })
+      }
+      data.pendingApprovals.unshift(approval)
+      await saveData()
+      return sendJson(response, 202, { approval: publicApproval(approval) })
+    }
+
+    if (request.method === 'PUT' && /^\/api\/users\/[^/]+$/.test(url.pathname)) {
+      const targetId = decodeURIComponent(url.pathname.split('/').pop())
+      const target = data.users.find((item) => item.id === targetId)
+      if (!actor.isFormTeacher || target?.role !== 'student' || !canAccessClass(actor, target.className)) {
+        throw new ApiError(403, 'Only a form teacher can request edits for students in their assigned classes.')
+      }
+    }
+
+    let approvalPhoto
+    if (request.method === 'POST' && /\/profile-photo$/.test(url.pathname)) {
+      const targetId = decodeURIComponent(url.pathname.split('/')[3])
+      const target = data.users.find((item) => item.id === targetId)
+      if (actor.id !== target?.id && (target?.role !== 'student' || !canAccessClass(actor, target.className))) {
+        throw new ApiError(403, 'You can request photo updates only for yourself or students in your assigned classes.')
+      }
+      approvalPhoto = parseProfileImage(body.dataUrl)
+      delete body.dataUrl
+      body.photoAttached = true
+    }
+
+    const approval = {
+      id: randomBytes(10).toString('hex'),
+      actorId: actor.id,
+      method: request.method,
+      path: url.pathname,
+      body,
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+    }
+    data.pendingApprovals.unshift(approval)
+    await saveData()
+    return sendJson(response, 202, { approval: publicApproval(approval) })
+  }
+
   if (request.method === 'POST' && url.pathname === '/api/login') {
     const body = await readJson(request)
     const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : ''
@@ -641,6 +816,74 @@ async function handleApi(request, response, url) {
     return sendJson(response, 200, { ok: true })
   }
 
+  if (request.method === 'GET' && url.pathname === '/api/approvals') {
+    requireUser(request, ['admin'])
+    return sendJson(response, 200, {
+      approvals: data.pendingApprovals.slice(0, 500).map(publicApproval),
+    })
+  }
+
+  const approvalDecisionMatch = url.pathname.match(/^\/api\/approvals\/([^/]+)\/decision$/)
+  if (request.method === 'POST' && approvalDecisionMatch) {
+    const admin = requireUser(request, ['admin'])
+    const body = await readJson(request)
+    const approval = data.pendingApprovals.find((item) => item.id === decodeURIComponent(approvalDecisionMatch[1]))
+    if (!approval) throw new ApiError(404, 'Approval request not found.')
+    if (approval.status !== 'pending') throw new ApiError(409, 'This approval request has already been reviewed.')
+    if (!['approve', 'reject'].includes(body.decision)) {
+      throw new ApiError(400, 'Choose approve or reject.')
+    }
+
+    approval.decision = body.decision
+    approval.decisionNote = typeof body.note === 'string' ? body.note.trim().slice(0, 500) : ''
+    approval.decidedAt = new Date().toISOString()
+    approval.decidedBy = admin.id
+    if (body.decision === 'reject') {
+      approval.status = 'rejected'
+      await saveData()
+      if (approval.photoId) await profilePhotoCollection.deleteOne({ _id: approval.photoId })
+      return sendJson(response, 200, { approval: publicApproval(approval) })
+    }
+
+    const approvalPhoto = approval.photoId
+      ? await profilePhotoCollection.findOne({ _id: approval.photoId })
+      : null
+    approval.status = 'processing'
+    await saveData()
+    const replayToken = randomBytes(32).toString('hex')
+    sessions.set(replayToken, approval.actorId)
+    const replayRequest = Readable.from([JSON.stringify(approval.body || {})])
+    Object.assign(replayRequest, {
+      method: approval.method,
+      url: approval.path,
+      headers: { authorization: `Bearer ${replayToken}` },
+      approvalExecution: true,
+      approvalCredential: approval.credentials,
+      approvalPhoto,
+    })
+    const replayResponse = {
+      status: 500,
+      body: '',
+      writeHead(status) { this.status = status },
+      end(value = '') { this.body = value.toString() },
+    }
+    try {
+      await handleApi(replayRequest, replayResponse, new URL(approval.path, 'https://portal.local'))
+      if (replayResponse.status < 200 || replayResponse.status >= 300) {
+        throw new Error(`The requested action returned HTTP ${replayResponse.status}.`)
+      }
+      approval.status = 'approved'
+    } catch (replayError) {
+      approval.status = 'failed'
+      approval.error = replayError.message || 'The requested action could not be completed.'
+    } finally {
+      sessions.delete(replayToken)
+    }
+    await saveData()
+    if (approval.photoId) await profilePhotoCollection.deleteOne({ _id: approval.photoId })
+    return sendJson(response, 200, { approval: publicApproval(approval) })
+  }
+
   if (request.method === 'GET' && url.pathname === '/api/portal') {
     await finalizeExpiredActivities()
     const user = requireUser(request)
@@ -695,13 +938,13 @@ async function handleApi(request, response, url) {
     const body = await readJson(request)
     const name = requireText(body.name, 'Name')
     const email = requireText(body.email, 'Email', 254).toLowerCase()
-    const password = requireText(body.password, 'Password', 100)
+    const password = request.approvalCredential ? '' : requireText(body.password, 'Password', 100)
     const role = creator.role === 'teacher'
-      ? body.role === 'student' ? 'student' : null
+      ? creator.isFormTeacher && body.role === 'student' ? 'student' : null
       : ROLES.includes(body.role) && body.role !== 'admin' ? body.role : null
-    if (!role) throw new ApiError(400, 'Choose teacher or student as the account role.')
+    if (!role) throw new ApiError(403, 'Only an admin or form teacher can create a student account.')
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new ApiError(400, 'Enter a valid email address.')
-    if (password.length < 8) throw new ApiError(400, 'Password must be at least 8 characters long.')
+    if (!request.approvalCredential && password.length < 8) throw new ApiError(400, 'Password must be at least 8 characters long.')
     if (data.users.some((item) => item.email.toLowerCase() === email)) throw new ApiError(409, 'An account with that email already exists.')
     const requestedClass = typeof body.className === 'string' ? body.className.trim().slice(0, 60) : ''
     const className = creator.role === 'teacher'
@@ -710,9 +953,25 @@ async function handleApi(request, response, url) {
     if (creator.role === 'teacher' && !teacherClassNames(creator).includes(className)) {
       throw new ApiError(403, 'You can create student accounts only in your assigned classes.')
     }
+    if (role === 'student') requireText(className, 'Class', 60)
     const subject = role === 'teacher' ? requireText(body.subject, 'Teaching subject', 80) : ''
     if (role === 'teacher' && !className) throw new ApiError(400, 'Assign a class to this teacher.')
-    const user = makeUser({ name, email, password, role, className, subject })
+    const gender = role === 'student' ? requireText(body.gender, 'Gender', 10).toLowerCase() : ''
+    if (role === 'student' && !['male', 'female'].includes(gender)) throw new ApiError(400, 'Choose male or female for the student.')
+    const dateOfBirth = role === 'student' ? requireDate(body.dateOfBirth, 'Date of birth') : ''
+    const dateJoined = role === 'student' ? requireDate(body.dateJoined, 'Date joined') : ''
+    const user = makeUser({
+      name,
+      email,
+      password,
+      role,
+      className,
+      subject,
+      gender,
+      dateOfBirth,
+      dateJoined,
+      credentials: request.approvalCredential,
+    })
     data.users.push(user)
     await saveData()
     return sendJson(response, 201, { user: publicUser(user) })
@@ -741,17 +1000,76 @@ async function handleApi(request, response, url) {
   if (request.method === 'PUT' && formTeacherClassesMatch) {
     requireUser(request, ['admin'])
     const body = await readJson(request)
-    if (!Array.isArray(body.classNames) || body.classNames.length > 50) {
+    if (typeof body.isFormTeacher !== 'boolean' || !Array.isArray(body.classNames) || body.classNames.length > 50) {
       throw new ApiError(400, 'Choose up to 50 form-teacher classes.')
     }
     const userId = decodeURIComponent(formTeacherClassesMatch[1])
     const teacher = data.users.find((item) => item.id === userId && item.role === 'teacher')
     if (!teacher) throw new ApiError(404, 'Teacher account not found.')
     const requestedClasses = body.classNames.map((name) => requireText(name, 'Class', 60))
-    teacher.formTeacherClassNames = [...new Set(requestedClasses)]
-      .filter((className) => className !== teacher.className)
+    teacher.isFormTeacher = body.isFormTeacher
+    teacher.formTeacherClassNames = teacher.isFormTeacher
+      ? [...new Set(requestedClasses)].filter((className) => className !== teacher.className)
+      : []
     await saveData()
     return sendJson(response, 200, { user: publicUser(teacher) })
+  }
+
+  const editUserMatch = url.pathname.match(/^\/api\/users\/([^/]+)$/)
+  if (request.method === 'PUT' && editUserMatch) {
+    const editor = requireUser(request, ['admin', 'teacher'])
+    const body = await readJson(request)
+    const userId = decodeURIComponent(editUserMatch[1])
+    const target = data.users.find((item) => item.id === userId)
+    if (!target) throw new ApiError(404, 'User account not found.')
+    if (editor.role === 'teacher' &&
+      (!editor.isFormTeacher || target.role !== 'student' || !canAccessClass(editor, target.className))) {
+      throw new ApiError(403, 'Only a form teacher can edit students in their assigned classes.')
+    }
+
+    const name = body.name === undefined ? target.name : requireText(body.name, 'Name')
+    const email = body.email === undefined ? target.email : requireText(body.email, 'Email', 254).toLowerCase()
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new ApiError(400, 'Enter a valid email address.')
+    if (data.users.some((item) => item.id !== target.id && item.email.toLowerCase() === email)) {
+      throw new ApiError(409, 'An account with that email already exists.')
+    }
+    const className = body.className === undefined ? target.className : requireText(body.className, 'Class', 60)
+    if (editor.role === 'teacher' && !canAccessClass(editor, className)) {
+      throw new ApiError(403, 'You can only keep students in one of your assigned classes.')
+    }
+    const subject = target.role === 'teacher'
+      ? body.subject === undefined ? target.subject : requireText(body.subject, 'Subject', 80)
+      : target.subject
+    let gender = target.gender
+    let dateOfBirth = target.dateOfBirth
+    let dateJoined = target.dateJoined
+    if (target.role === 'student') {
+      gender = body.gender === undefined
+        ? target.gender
+        : body.gender === ''
+          ? ''
+          : requireText(body.gender, 'Gender', 10).toLowerCase()
+      if (gender && !['male', 'female'].includes(gender)) throw new ApiError(400, 'Choose male or female for the student.')
+      dateOfBirth = body.dateOfBirth === undefined
+        ? target.dateOfBirth
+        : body.dateOfBirth === ''
+          ? ''
+          : requireDate(body.dateOfBirth, 'Date of birth')
+      dateJoined = body.dateJoined === undefined
+        ? target.dateJoined
+        : body.dateJoined === ''
+          ? ''
+          : requireDate(body.dateJoined, 'Date joined')
+    }
+    target.name = name
+    target.email = email
+    target.className = className
+    target.subject = subject
+    target.gender = gender
+    target.dateOfBirth = dateOfBirth
+    target.dateJoined = dateJoined
+    await saveData()
+    return sendJson(response, 200, { user: publicUser(target) })
   }
 
   const profilePhotoMatch = url.pathname.match(/^\/api\/users\/([^/]+)\/profile-photo$/)
@@ -786,23 +1104,13 @@ async function handleApi(request, response, url) {
       throw new ApiError(403, 'Teachers can upload profile photos only for themselves or students in their assigned classes.')
     }
     const body = await readJson(request)
-    const dataUrlMatch = typeof body.dataUrl === 'string'
-      ? body.dataUrl.match(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/]+={0,2})$/)
-      : null
-    if (!dataUrlMatch) throw new ApiError(400, 'Choose a JPEG, PNG, or WebP image.')
-    const imageBytes = Buffer.from(dataUrlMatch[2], 'base64')
-    if (imageBytes.length < 1 || imageBytes.length > 700 * 1024) {
-      throw new ApiError(413, 'Profile photos must be 700 KB or smaller.')
-    }
-    if (!validProfileImage(dataUrlMatch[1], imageBytes)) {
-      throw new ApiError(400, 'The uploaded file is not a valid image.')
-    }
+    const photo = request.approvalPhoto || parseProfileImage(body.dataUrl)
     await profilePhotoCollection.updateOne(
       { _id: target.id },
       {
         $set: {
-          contentType: dataUrlMatch[1],
-          data: dataUrlMatch[2],
+          contentType: photo.contentType,
+          data: photo.data,
           updatedAt: new Date().toISOString(),
         },
       },
