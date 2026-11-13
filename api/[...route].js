@@ -1,3 +1,3 @@
-import { vercelFetchHandler } from '../index.js'
+import { vercelNodeHandler } from '../index.js'
 
-export default { fetch: vercelFetchHandler }
+export default vercelNodeHandler

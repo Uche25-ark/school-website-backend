@@ -1,7 +1,6 @@
 import 'dotenv/config'
 import { createServer } from 'node:http'
 import { readFile } from 'node:fs/promises'
-import { Readable } from 'node:stream'
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
@@ -980,7 +979,7 @@ async function serveSite(request, response, url) {
   }
 }
 
-async function handleVercelNodeRequest(request, response) {
+export async function vercelNodeHandler(request, response) {
   const origin = request.headers.origin
   const allowedOrigins = (process.env.FRONTEND_ORIGINS || process.env.FRONTEND_ORIGIN || '')
     .split(',')
@@ -1028,35 +1027,6 @@ async function handleVercelNodeRequest(request, response) {
     console.error(error)
     return sendJson(response, 500, { error: 'The server could not complete the request.' })
   }
-}
-
-export async function vercelFetchHandler(request) {
-  const nodeRequest = request.body ? Readable.fromWeb(request.body) : Readable.from([])
-  nodeRequest.setEncoding('utf8')
-  nodeRequest.method = request.method
-  const requestUrl = new URL(request.url)
-  nodeRequest.url = `${requestUrl.pathname}${requestUrl.search}`
-  nodeRequest.headers = Object.fromEntries(request.headers.entries())
-
-  const responseHeaders = new Headers()
-  let responseStatus = 200
-  let responseBody = ''
-  const nodeResponse = {
-    setHeader(name, value) {
-      responseHeaders.set(name, value)
-    },
-    writeHead(status, headers = {}) {
-      responseStatus = status
-      for (const [name, value] of Object.entries(headers)) responseHeaders.set(name, value)
-    },
-    end(body = '') {
-      responseBody += typeof body === 'string' ? body : Buffer.from(body).toString()
-    },
-  }
-
-  await handleVercelNodeRequest(nodeRequest, nodeResponse)
-  const body = responseStatus === 204 || responseStatus === 304 ? null : responseBody
-  return new Response(body, { status: responseStatus, headers: responseHeaders })
 }
 
 export async function startLocalServer() {
