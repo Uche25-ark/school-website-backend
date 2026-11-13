@@ -39,6 +39,7 @@ function makeUser({ name, email, password, role, className = '', subject = '' })
     role,
     className,
     subject,
+    formTeacherClassNames: [],
     salt,
     passwordHash: hashPassword(password, salt),
   }
@@ -92,6 +93,7 @@ let saveQueue = Promise.resolve()
 let portalCollection
 let sessionCollection
 let lockCollection
+let profilePhotoCollection
 let connectPromise
 
 async function saveData() {
@@ -171,6 +173,13 @@ async function loadData() {
     needsSave = true
   }
 
+  for (const user of data.users) {
+    if (!Array.isArray(user.formTeacherClassNames)) {
+      user.formTeacherClassNames = []
+      needsSave = true
+    }
+  }
+
   if (needsSave) await saveData()
 }
 
@@ -187,6 +196,7 @@ async function connectDatabase() {
       portalCollection = database.collection('portal_state')
       sessionCollection = database.collection('portal_sessions')
       lockCollection = database.collection('portal_locks')
+      profilePhotoCollection = database.collection('portal_profile_photos')
     })()
   }
   try {
@@ -306,6 +316,28 @@ function assignedClass(user, requestedClass) {
     throw new ApiError(403, 'You can only manage your assigned class.')
   }
   return className
+}
+
+function teacherClassNames(user) {
+  if (user.role !== 'teacher') return []
+  return [...new Set([user.className, ...(user.formTeacherClassNames || [])].filter(Boolean))]
+}
+
+function canAccessClass(user, className) {
+  return user.role === 'admin' ||
+    (user.role === 'teacher' && teacherClassNames(user).includes(className))
+}
+
+function validProfileImage(contentType, bytes) {
+  if (contentType === 'image/png') {
+    return bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+  }
+  if (contentType === 'image/jpeg') {
+    return bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff
+  }
+  return contentType === 'image/webp' &&
+    bytes.toString('ascii', 0, 4) === 'RIFF' &&
+    bytes.toString('ascii', 8, 12) === 'WEBP'
 }
 
 function assignedSubject(user, requestedSubject) {
@@ -467,6 +499,67 @@ async function finalizeExpiredActivities(now = Date.now()) {
   if (changed) await saveData()
 }
 
+function buildReportCard(teacher, body) {
+  const student = data.users.find((item) => item.id === body.studentId && item.role === 'student')
+  if (!student || (teacher.role === 'teacher' && !canAccessClass(teacher, student.className))) {
+    throw new ApiError(400, 'Choose a student from one of your assigned classes.')
+  }
+  const subject = assignedSubject(teacher, body.subject)
+  const parseScore = (value, label, maximum) => {
+    if ((typeof value !== 'number' && typeof value !== 'string') || (typeof value === 'string' && !value.trim())) {
+      throw new ApiError(400, `${label} must be a number between 0 and ${maximum}.`)
+    }
+    const score = Number(value)
+    if (!Number.isFinite(score) || score < 0 || score > maximum) {
+      throw new ApiError(400, `${label} must be a number between 0 and ${maximum}.`)
+    }
+    return score
+  }
+  const continuousAssessment = parseScore(body.continuousAssessment, 'Continuous assessment', 40)
+  const examScore = parseScore(body.examScore, 'Exam score', 60)
+  const totalScore = continuousAssessment + examScore
+  const grade = totalScore >= 70 ? 'A' : totalScore >= 60 ? 'B' : totalScore >= 50 ? 'C' : totalScore >= 40 ? 'D' : totalScore >= 30 ? 'E' : 'F'
+  const attendancePresent = Number(body.attendancePresent ?? 0)
+  const attendanceTotal = Number(body.attendanceTotal ?? 0)
+  if (!Number.isInteger(attendancePresent) || !Number.isInteger(attendanceTotal) || attendancePresent < 0 || attendanceTotal < attendancePresent) {
+    throw new ApiError(400, 'Attendance days must be whole numbers and present days cannot exceed school days.')
+  }
+  if (teacher.role === 'teacher' && typeof body.headTeacherRemark === 'string' && body.headTeacherRemark.trim()) {
+    throw new ApiError(403, 'Only an admin can add a head teacher remark.')
+  }
+  return {
+    id: randomBytes(8).toString('hex'),
+    studentId: student.id,
+    studentName: student.name,
+    className: student.className,
+    subject,
+    term: requireText(body.term, 'Term', 80),
+    academicYear: requireText(body.academicYear, 'Academic year', 20),
+    continuousAssessment,
+    examScore,
+    totalScore,
+    grade,
+    teacherComment: typeof body.teacherComment === 'string' ? body.teacherComment.trim().slice(0, 1000) : '',
+    attendancePresent,
+    attendanceTotal,
+    conduct: typeof body.conduct === 'string' ? body.conduct.trim().slice(0, 80) : '',
+    headTeacherRemark: teacher.role === 'admin' && typeof body.headTeacherRemark === 'string' ? body.headTeacherRemark.trim().slice(0, 1000) : '',
+    recordedBy: teacher.id,
+    updatedAt: new Date().toISOString(),
+  }
+}
+
+function storeReportCard(reportCard) {
+  const key = (item) => [
+    item.studentId,
+    item.subject?.toLowerCase(),
+    item.term?.toLowerCase(),
+    item.academicYear?.toLowerCase(),
+  ].join(':')
+  data.reportCards = data.reportCards.filter((item) => key(item) !== key(reportCard))
+  data.reportCards.push(reportCard)
+}
+
 async function handleApi(request, response, url) {
   if (request.method === 'POST' && url.pathname === '/api/login') {
     const body = await readJson(request)
@@ -551,53 +644,168 @@ async function handleApi(request, response, url) {
   if (request.method === 'GET' && url.pathname === '/api/portal') {
     await finalizeExpiredActivities()
     const user = requireUser(request)
-    const students = data.users.filter((item) => item.role === 'student' && (user.role === 'admin' || item.className === user.className))
+    const students = data.users.filter((item) => item.role === 'student' && canAccessClass(user, item.className))
     return sendJson(response, 200, {
       user: publicUser(user),
       users: user.role === 'admin' ? data.users.map(publicUser) : [],
       students: user.role === 'student' ? [] : students.map(publicUser),
-      assignments: (user.role === 'student' ? data.assignments.filter((item) => item.className === user.className) : data.assignments)
+      assignments: data.assignments
+        .filter((item) => user.role === 'admin' ||
+          (user.role === 'teacher' && canAccessClass(user, item.className)) ||
+          (user.role === 'student' && item.className === user.className))
         .map((assignment) => ({
           ...assignment,
           questionCount: (assignment.questions || []).length,
           questions: user.role === 'student' ? [] : (assignment.questions || []).map(({ id, text, options }) => ({ id, text, options })),
         })),
       exams: data.exams
-        .filter((item) => user.role === 'admin' || item.className === user.className)
+        .filter((item) => user.role === 'admin' ||
+          (user.role === 'teacher' && canAccessClass(user, item.className)) ||
+          (user.role === 'student' && item.className === user.className))
         .map((exam) => ({
           ...exam,
           questionCount: exam.questions.length,
           questions: user.role === 'student' ? [] : exam.questions.map(({ id, text, options }) => ({ id, text, options })),
         })),
       examAttempts: data.examAttempts.filter((item) => user.role === 'student' && item.studentId === user.id),
-      attendance: data.attendance.filter((item) => user.role === 'admin' || item.className === user.className),
-      results: data.results.filter((item) => user.role === 'admin' || (user.role === 'teacher' ? item.className === user.className : item.studentId === user.id)),
-      reportCards: data.reportCards.filter((item) => user.role === 'admin' || (user.role === 'teacher' ? item.className === user.className : item.studentId === user.id)),
-      assessments: data.assessments.filter((item) => user.role === 'admin' || item.className === user.className),
-      assessmentRecords: data.assessmentRecords.filter((item) => user.role === 'admin' || (user.role === 'teacher' ? item.className === user.className : item.studentId === user.id)),
+      attendance: data.attendance.filter((item) => user.role === 'admin' ||
+        (user.role === 'teacher' && canAccessClass(user, item.className)) ||
+        (user.role === 'student' && item.studentId === user.id)),
+      results: data.results.filter((item) => user.role === 'admin' ||
+        (user.role === 'teacher' && canAccessClass(user, item.className)) ||
+        (user.role === 'student' && item.studentId === user.id)),
+      reportCards: data.reportCards.filter((item) => user.role === 'admin' ||
+        (user.role === 'teacher' && canAccessClass(user, item.className)) ||
+        (user.role === 'student' && item.studentId === user.id)),
+      assessments: data.assessments.filter((item) => user.role === 'admin' ||
+        (user.role === 'teacher' && canAccessClass(user, item.className)) ||
+        (user.role === 'student' && item.className === user.className)),
+      assessmentRecords: data.assessmentRecords.filter((item) => user.role === 'admin' ||
+        (user.role === 'teacher' && canAccessClass(user, item.className)) ||
+        (user.role === 'student' && item.studentId === user.id)),
       assignmentAttempts: data.assignmentAttempts.filter((item) => user.role === 'student' && item.studentId === user.id),
-      assignmentSubmissions: data.assignmentSubmissions.filter((item) => user.role === 'admin' || (user.role === 'teacher' ? item.className === user.className : item.studentId === user.id)),
+      assignmentSubmissions: data.assignmentSubmissions.filter((item) => user.role === 'admin' ||
+        (user.role === 'teacher' && canAccessClass(user, item.className)) ||
+        (user.role === 'student' && item.studentId === user.id)),
     })
   }
 
   if (request.method === 'POST' && url.pathname === '/api/users') {
-    requireUser(request, ['admin'])
+    const creator = requireUser(request, ['admin', 'teacher'])
     const body = await readJson(request)
     const name = requireText(body.name, 'Name')
     const email = requireText(body.email, 'Email', 254).toLowerCase()
     const password = requireText(body.password, 'Password', 100)
-    const role = ROLES.includes(body.role) && body.role !== 'admin' ? body.role : null
+    const role = creator.role === 'teacher'
+      ? body.role === 'student' ? 'student' : null
+      : ROLES.includes(body.role) && body.role !== 'admin' ? body.role : null
     if (!role) throw new ApiError(400, 'Choose teacher or student as the account role.')
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new ApiError(400, 'Enter a valid email address.')
     if (password.length < 8) throw new ApiError(400, 'Password must be at least 8 characters long.')
     if (data.users.some((item) => item.email.toLowerCase() === email)) throw new ApiError(409, 'An account with that email already exists.')
-    const className = typeof body.className === 'string' ? body.className.trim().slice(0, 60) : ''
+    const requestedClass = typeof body.className === 'string' ? body.className.trim().slice(0, 60) : ''
+    const className = creator.role === 'teacher'
+      ? requestedClass || creator.className || teacherClassNames(creator)[0] || ''
+      : requestedClass
+    if (creator.role === 'teacher' && !teacherClassNames(creator).includes(className)) {
+      throw new ApiError(403, 'You can create student accounts only in your assigned classes.')
+    }
     const subject = role === 'teacher' ? requireText(body.subject, 'Teaching subject', 80) : ''
     if (role === 'teacher' && !className) throw new ApiError(400, 'Assign a class to this teacher.')
     const user = makeUser({ name, email, password, role, className, subject })
     data.users.push(user)
     await saveData()
     return sendJson(response, 201, { user: publicUser(user) })
+  }
+
+  const resetPasswordMatch = url.pathname.match(/^\/api\/users\/([^/]+)\/reset-password$/)
+  if (request.method === 'POST' && resetPasswordMatch) {
+    requireUser(request, ['admin'])
+    const body = await readJson(request)
+    const newPassword = requireText(body.newPassword, 'New password', 100)
+    if (newPassword.length < 8) throw new ApiError(400, 'New password must be at least 8 characters long.')
+    const userId = decodeURIComponent(resetPasswordMatch[1])
+    const user = data.users.find((item) => item.id === userId)
+    if (!user) throw new ApiError(404, 'User account not found.')
+    user.salt = randomBytes(16).toString('hex')
+    user.passwordHash = hashPassword(newPassword, user.salt)
+    for (const [session, sessionUserId] of sessions) {
+      if (sessionUserId === user.id) sessions.delete(session)
+    }
+    await sessionCollection.deleteMany({ userId: user.id })
+    await saveData()
+    return sendJson(response, 200, { ok: true })
+  }
+
+  const formTeacherClassesMatch = url.pathname.match(/^\/api\/users\/([^/]+)\/form-teacher-classes$/)
+  if (request.method === 'PUT' && formTeacherClassesMatch) {
+    requireUser(request, ['admin'])
+    const body = await readJson(request)
+    if (!Array.isArray(body.classNames) || body.classNames.length > 50) {
+      throw new ApiError(400, 'Choose up to 50 form-teacher classes.')
+    }
+    const userId = decodeURIComponent(formTeacherClassesMatch[1])
+    const teacher = data.users.find((item) => item.id === userId && item.role === 'teacher')
+    if (!teacher) throw new ApiError(404, 'Teacher account not found.')
+    const requestedClasses = body.classNames.map((name) => requireText(name, 'Class', 60))
+    teacher.formTeacherClassNames = [...new Set(requestedClasses)]
+      .filter((className) => className !== teacher.className)
+    await saveData()
+    return sendJson(response, 200, { user: publicUser(teacher) })
+  }
+
+  const profilePhotoMatch = url.pathname.match(/^\/api\/users\/([^/]+)\/profile-photo$/)
+  if (profilePhotoMatch && request.method === 'GET') {
+    const viewer = requireUser(request)
+    const userId = decodeURIComponent(profilePhotoMatch[1])
+    const student = data.users.find((item) => item.id === userId && item.role === 'student')
+    if (!student) throw new ApiError(404, 'Student account not found.')
+    const mayView = viewer.role === 'admin' ||
+      (viewer.role === 'teacher' && canAccessClass(viewer, student.className)) ||
+      (viewer.role === 'student' && viewer.id === student.id)
+    if (!mayView) throw new ApiError(403, 'You cannot view this student profile photo.')
+    const photo = await profilePhotoCollection.findOne({ _id: student.id })
+    if (!photo) throw new ApiError(404, 'No profile photo has been uploaded.')
+    response.writeHead(200, {
+      'content-type': photo.contentType,
+      'cache-control': 'private, no-store',
+      'x-content-type-options': 'nosniff',
+    })
+    return response.end(Buffer.from(photo.data, 'base64'))
+  }
+
+  if (profilePhotoMatch && request.method === 'POST') {
+    const uploader = requireUser(request, ['admin', 'teacher'])
+    const userId = decodeURIComponent(profilePhotoMatch[1])
+    const student = data.users.find((item) => item.id === userId && item.role === 'student')
+    if (!student) throw new ApiError(404, 'Student account not found.')
+    if (uploader.role === 'teacher' && !canAccessClass(uploader, student.className)) {
+      throw new ApiError(403, 'You can upload photos only for students in your assigned classes.')
+    }
+    const body = await readJson(request)
+    const dataUrlMatch = typeof body.dataUrl === 'string'
+      ? body.dataUrl.match(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/]+={0,2})$/)
+      : null
+    if (!dataUrlMatch) throw new ApiError(400, 'Choose a JPEG, PNG, or WebP image.')
+    const imageBytes = Buffer.from(dataUrlMatch[2], 'base64')
+    if (imageBytes.length < 1 || imageBytes.length > 700 * 1024) {
+      throw new ApiError(413, 'Profile photos must be 700 KB or smaller.')
+    }
+    if (!validProfileImage(dataUrlMatch[1], imageBytes)) {
+      throw new ApiError(400, 'The uploaded file is not a valid image.')
+    }
+    await profilePhotoCollection.updateOne(
+      { _id: student.id },
+      {
+        $set: {
+          contentType: dataUrlMatch[1],
+          data: dataUrlMatch[2],
+          updatedAt: new Date().toISOString(),
+        },
+      },
+      { upsert: true },
+    )
+    return sendJson(response, 200, { ok: true })
   }
 
   const deleteUserMatch = url.pathname.match(/^\/api\/users\/([^/]+)$/)
@@ -612,6 +820,7 @@ async function handleApi(request, response, url) {
       if (sessionUserId === userId) sessions.delete(session)
     }
     await sessionCollection.deleteMany({ userId })
+    await profilePhotoCollection.deleteOne({ _id: userId })
     await saveData()
     return sendJson(response, 200, { ok: true })
   }
@@ -801,9 +1010,9 @@ async function handleApi(request, response, url) {
     const assignmentSubmission = data.assignmentSubmissions.find((item) => item.id === resultFeedbackMatch[1])
     const record = result || assignmentSubmission
     if (!record) throw new ApiError(404, 'Student result not found.')
-    if (teacher.role === 'teacher' && (record.className !== teacher.className ||
+    if (teacher.role === 'teacher' && (!canAccessClass(teacher, record.className) ||
       (teacher.subject && record.subject && record.subject.toLowerCase() !== teacher.subject.toLowerCase()))) {
-      throw new ApiError(403, 'You can only review results for your assigned class and subject.')
+      throw new ApiError(403, 'You can only review results for your assigned classes and subject.')
     }
     record.teacherFeedback = feedback
     record.reviewedAt = new Date().toISOString()
@@ -814,50 +1023,33 @@ async function handleApi(request, response, url) {
   if (request.method === 'POST' && url.pathname === '/api/report-cards') {
     const teacher = requireUser(request, ['admin', 'teacher'])
     const body = await readJson(request)
-    const student = data.users.find((item) => item.id === body.studentId && item.role === 'student')
-    if (!student || (teacher.role === 'teacher' && student.className !== teacher.className)) {
-      throw new ApiError(400, 'Choose a student from your class.')
-    }
-    const subject = assignedSubject(teacher, body.subject)
-    const continuousAssessment = Number(body.continuousAssessment)
-    const examScore = Number(body.examScore)
-    if (!Number.isFinite(continuousAssessment) || continuousAssessment < 0 || continuousAssessment > 40) {
-      throw new ApiError(400, 'Continuous assessment must be between 0 and 40.')
-    }
-    if (!Number.isFinite(examScore) || examScore < 0 || examScore > 60) {
-      throw new ApiError(400, 'Exam score must be between 0 and 60.')
-    }
-    const totalScore = continuousAssessment + examScore
-    const grade = totalScore >= 70 ? 'A' : totalScore >= 60 ? 'B' : totalScore >= 50 ? 'C' : totalScore >= 40 ? 'D' : totalScore >= 30 ? 'E' : 'F'
-    const attendancePresent = Number(body.attendancePresent)
-    const attendanceTotal = Number(body.attendanceTotal)
-    if (!Number.isInteger(attendancePresent) || !Number.isInteger(attendanceTotal) || attendancePresent < 0 || attendanceTotal < attendancePresent) {
-      throw new ApiError(400, 'Attendance days must be whole numbers and present days cannot exceed school days.')
-    }
-    const reportCard = {
-      id: randomBytes(8).toString('hex'),
-      studentId: student.id,
-      studentName: student.name,
-      className: student.className,
-      subject,
-      term: requireText(body.term, 'Term', 80),
-      academicYear: requireText(body.academicYear, 'Academic year', 20),
-      continuousAssessment,
-      examScore,
-      totalScore,
-      grade,
-      teacherComment: requireText(body.teacherComment, 'Teacher comment', 1000),
-      attendancePresent,
-      attendanceTotal,
-      conduct: typeof body.conduct === 'string' ? body.conduct.trim().slice(0, 80) : '',
-      headTeacherRemark: typeof body.headTeacherRemark === 'string' ? body.headTeacherRemark.trim().slice(0, 1000) : '',
-      recordedBy: teacher.id,
-      updatedAt: new Date().toISOString(),
-    }
-    data.reportCards = data.reportCards.filter((item) => !(item.studentId === student.id && item.subject?.toLowerCase() === subject.toLowerCase() && item.term === reportCard.term && item.academicYear === reportCard.academicYear))
-    data.reportCards.push(reportCard)
+    const reportCard = buildReportCard(teacher, body)
+    storeReportCard(reportCard)
     await saveData()
     return sendJson(response, 201, { reportCard })
+  }
+
+  if (request.method === 'POST' && url.pathname === '/api/report-cards/import') {
+    const teacher = requireUser(request, ['admin', 'teacher'])
+    const body = await readJson(request)
+    if (!Array.isArray(body.records) || body.records.length < 1 || body.records.length > 500) {
+      throw new ApiError(400, 'Upload between 1 and 500 results rows.')
+    }
+    const reportCards = body.records.map((record) => buildReportCard(teacher, record))
+    const keys = new Set()
+    for (const reportCard of reportCards) {
+      const key = [
+        reportCard.studentId,
+        reportCard.subject.toLowerCase(),
+        reportCard.term.toLowerCase(),
+        reportCard.academicYear.toLowerCase(),
+      ].join(':')
+      if (keys.has(key)) throw new ApiError(400, 'The CSV has duplicate rows for the same student, subject, term, and year.')
+      keys.add(key)
+    }
+    for (const reportCard of reportCards) storeReportCard(reportCard)
+    await saveData()
+    return sendJson(response, 201, { ok: true, imported: reportCards.length })
   }
 
   if (request.method === 'POST' && url.pathname === '/api/exams') {
