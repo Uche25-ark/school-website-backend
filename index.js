@@ -1312,6 +1312,51 @@ async function handleApi(request, response, url) {
     return sendJson(response, 200, { ok: true })
   }
 
+  const submissionReviewMatch = url.pathname.match(/^\/api\/results\/([^/]+)\/submission$/)
+  if (request.method === 'GET' && submissionReviewMatch) {
+    const reviewer = requireUser(request, ['admin', 'teacher'])
+    const resultId = decodeURIComponent(submissionReviewMatch[1])
+    const result = data.results.find((item) => item.id === resultId)
+    const assignmentSubmission = data.assignmentSubmissions.find((item) => item.id === resultId)
+    const submission = result || assignmentSubmission
+    if (!submission) throw new ApiError(404, 'Student result not found.')
+    if (reviewer.role === 'teacher' && (!canAccessClass(reviewer, submission.className) ||
+      (reviewer.subject && submission.subject && submission.subject.toLowerCase() !== reviewer.subject.toLowerCase()))) {
+      throw new ApiError(403, 'You can only review results for your assigned classes and subject.')
+    }
+
+    const activity = result
+      ? data.exams.find((item) => item.id === result.examId)
+      : data.assignments.find((item) => item.id === assignmentSubmission.assignmentId)
+    if (!activity) throw new ApiError(404, 'The submitted activity could not be found.')
+    const attempt = result
+      ? data.examAttempts.find((item) => item.examId === activity.id && item.studentId === submission.studentId)
+      : data.assignmentAttempts.find((item) => item.assignmentId === activity.id && item.studentId === submission.studentId)
+
+    return sendJson(response, 200, {
+      submission: {
+        id: submission.id,
+        title: activity.title,
+        studentName: submission.studentName,
+        score: submission.score,
+        total: submission.total,
+        questions: (activity.questions || []).map((question) => {
+          const studentAnswerIndex = attempt?.answers?.[question.id]
+          const hasAnswer = Number.isInteger(studentAnswerIndex) &&
+            studentAnswerIndex >= 0 &&
+            studentAnswerIndex < question.options.length
+          return {
+            id: question.id,
+            text: question.text,
+            studentAnswer: hasAnswer ? question.options[studentAnswerIndex] : null,
+            correctAnswer: question.options[question.correctIndex],
+            isCorrect: hasAnswer && studentAnswerIndex === question.correctIndex,
+          }
+        }),
+      },
+    })
+  }
+
   const resultFeedbackMatch = url.pathname.match(/^\/api\/results\/([^/]+)\/feedback$/)
   if (request.method === 'POST' && resultFeedbackMatch) {
     const teacher = requireUser(request, ['admin', 'teacher'])
